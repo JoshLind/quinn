@@ -12,8 +12,8 @@ use std::{
 
 use anyhow::{anyhow, bail, Context, Result};
 use clap::Parser;
-use tracing::{error, info, info_span};
-use tracing_futures::Instrument as _;
+use rustls::{Certificate, PrivateKey};
+use tracing::{error};
 
 mod common;
 
@@ -49,7 +49,7 @@ fn main() {
     let opt = Opt::parse();
     let code = {
         if let Err(e) = run(opt) {
-            eprintln!("ERROR: {e}");
+            println!("ERROR: {e}");
             1
         } else {
             0
@@ -60,7 +60,58 @@ fn main() {
 
 #[tokio::main]
 async fn run(options: Opt) -> Result<()> {
-    let (certs, key) = if let (Some(key_path), Some(cert_path)) = (&options.key, &options.cert) {
+    // Gather the certificate and private key
+    let (certificates, private_key) = gather_certificates_and_private_key(&options)?;
+
+    // Create the crypto server config using the root certificates and specified options
+    let mut server_crypto = rustls::ServerConfig::builder()
+        .with_safe_defaults()
+        .with_no_client_auth()
+        .with_single_cert(certificates, private_key)?;
+    server_crypto.alpn_protocols = common::ALPN_QUIC_HTTP.iter().map(|&x| x.into()).collect();
+    if options.keylog {
+        server_crypto.key_log = Arc::new(rustls::KeyLogFile::new());
+    }
+
+    // Create the QUIC server config
+    let mut server_config = quinn::ServerConfig::with_crypto(Arc::new(server_crypto));
+    if options.stateless_retry {
+        server_config.use_retry(true);
+    }
+
+    // Create the transport config
+    let transport_config = Arc::get_mut(&mut server_config.transport).unwrap();
+    transport_config.max_concurrent_uni_streams(0_u8.into()); // WHY??
+
+    // Get the root filepath to serve the files from
+    let root_filepath = Arc::<Path>::from(options.root.clone());
+    if !root_filepath.exists() {
+        bail!("root filepath does not exist");
+    }
+
+    // Create the server endpoint
+    let endpoint = quinn::Endpoint::server(server_config, options.listen)?;
+    println!("Server listening on {}", endpoint.local_addr()?);
+
+    // Accept incoming connections
+    while let Some(incoming_connection) = endpoint.accept().await {
+        println!("Got connection! Connection remote: {:?}", incoming_connection.remote_address());
+        let handle_connection_future = handle_connection(root_filepath.clone(), incoming_connection);
+        tokio::spawn(async move {
+            if let Err(e) = handle_connection_future.await {
+                error!("connection failed: {reason}", reason = e.to_string())
+            }
+        });
+    }
+
+    Ok(())
+}
+
+/// Gathers the certificates for the server and the private keys
+fn gather_certificates_and_private_key(options: &Opt) -> Result<(Vec<Certificate>, PrivateKey)> {
+    // If the user specified a certificate and a private key, use them
+    if let (Some(key_path), Some(cert_path)) = (&options.key, &options.cert) {
+        println!("using provided certificate and private key");
         let key = fs::read(key_path).context("failed to read private key")?;
         let key = if key_path.extension().map_or(false, |x| x == "der") {
             rustls::PrivateKey(key)
@@ -92,77 +143,41 @@ async fn run(options: Opt) -> Result<()> {
                 .collect()
         };
 
-        (cert_chain, key)
-    } else {
-        let dirs = directories_next::ProjectDirs::from("org", "quinn", "quinn-examples").unwrap();
-        let path = dirs.data_local_dir();
-        let cert_path = path.join("cert.der");
-        let key_path = path.join("key.der");
-        let (cert, key) = match fs::read(&cert_path).and_then(|x| Ok((x, fs::read(&key_path)?))) {
-            Ok(x) => x,
-            Err(ref e) if e.kind() == io::ErrorKind::NotFound => {
-                info!("generating self-signed certificate");
-                let cert = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
-                let key = cert.serialize_private_key_der();
-                let cert = cert.serialize_der().unwrap();
-                fs::create_dir_all(path).context("failed to create certificate directory")?;
-                fs::write(&cert_path, &cert).context("failed to write certificate")?;
-                fs::write(&key_path, &key).context("failed to write private key")?;
-                (cert, key)
-            }
-            Err(e) => {
-                bail!("failed to read certificate: {}", e);
-            }
-        };
+        return Ok((cert_chain, key));
+    }
 
-        let key = rustls::PrivateKey(key);
-        let cert = rustls::Certificate(cert);
-        (vec![cert], key)
+    // Otherwise, determine the paths and generate a self-signed certificate (if required)
+    let dirs = directories_next::ProjectDirs::from("org", "quinn", "quinn-examples").unwrap();
+    let path = dirs.data_local_dir();
+    let cert_path = path.join("cert.der");
+    let key_path = path.join("key.der");
+    println!("Certificate path: {:?} and key path: {:?}", cert_path, key_path);
+    let (cert, key) = match fs::read(&cert_path).and_then(|x| Ok((x, fs::read(&key_path)?))) {
+        Ok(x) => x,
+        Err(ref e) if e.kind() == io::ErrorKind::NotFound => {
+            println!("generating self-signed certificate");
+            let cert = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
+            let key = cert.serialize_private_key_der();
+            let cert = cert.serialize_der().unwrap();
+            fs::create_dir_all(path).context("failed to create certificate directory")?;
+            fs::write(&cert_path, &cert).context("failed to write certificate")?;
+            fs::write(&key_path, &key).context("failed to write private key")?;
+            (cert, key)
+        }
+        Err(e) => {
+            bail!("failed to read certificate: {}", e);
+        }
     };
 
-    let mut server_crypto = rustls::ServerConfig::builder()
-        .with_safe_defaults()
-        .with_no_client_auth()
-        .with_single_cert(certs, key)?;
-    server_crypto.alpn_protocols = common::ALPN_QUIC_HTTP.iter().map(|&x| x.into()).collect();
-    if options.keylog {
-        server_crypto.key_log = Arc::new(rustls::KeyLogFile::new());
-    }
-
-    let mut server_config = quinn::ServerConfig::with_crypto(Arc::new(server_crypto));
-    let transport_config = Arc::get_mut(&mut server_config.transport).unwrap();
-    transport_config.max_concurrent_uni_streams(0_u8.into());
-    if options.stateless_retry {
-        server_config.use_retry(true);
-    }
-
-    let root = Arc::<Path>::from(options.root.clone());
-    if !root.exists() {
-        bail!("root path does not exist");
-    }
-
-    let endpoint = quinn::Endpoint::server(server_config, options.listen)?;
-    eprintln!("listening on {}", endpoint.local_addr()?);
-
-    while let Some(conn) = endpoint.accept().await {
-        info!("connection incoming");
-        let fut = handle_connection(root.clone(), conn);
-        tokio::spawn(async move {
-            if let Err(e) = fut.await {
-                error!("connection failed: {reason}", reason = e.to_string())
-            }
-        });
-    }
-
-    Ok(())
+    Ok((vec![Certificate(cert)], PrivateKey(key)))
 }
 
-async fn handle_connection(root: Arc<Path>, conn: quinn::Connecting) -> Result<()> {
-    let connection = conn.await?;
-    let span = info_span!(
-        "connection",
-        remote = %connection.remote_address(),
-        protocol = %connection
+async fn handle_connection(root_filepath: Arc<Path>, incoming_connection: quinn::Connecting) -> Result<()> {
+    let connection = incoming_connection.await?;
+    println!(
+        "Got connection! Remote: {:?}, Protocol: {:?}",
+        connection.remote_address(),
+        connection
             .handshake_data()
             .unwrap()
             .downcast::<quinn::crypto::rustls::HandshakeData>().unwrap()
@@ -170,14 +185,14 @@ async fn handle_connection(root: Arc<Path>, conn: quinn::Connecting) -> Result<(
             .map_or_else(|| "<none>".into(), |x| String::from_utf8_lossy(&x).into_owned())
     );
     async {
-        info!("established");
+        println!("established");
 
         // Each stream initiated by the client constitutes a new request.
         loop {
             let stream = connection.accept_bi().await;
             let stream = match stream {
                 Err(quinn::ConnectionError::ApplicationClosed { .. }) => {
-                    info!("connection closed");
+                    println!("connection closed");
                     return Ok(());
                 }
                 Err(e) => {
@@ -185,74 +200,88 @@ async fn handle_connection(root: Arc<Path>, conn: quinn::Connecting) -> Result<(
                 }
                 Ok(s) => s,
             };
-            let fut = handle_request(root.clone(), stream);
+            let handle_request_future = handle_request(root_filepath.clone(), stream);
             tokio::spawn(
                 async move {
-                    if let Err(e) = fut.await {
-                        error!("failed: {reason}", reason = e.to_string());
+                    if let Err(e) = handle_request_future.await {
+                        error!("Request failed: {reason}", reason = e.to_string());
                     }
                 }
-                .instrument(info_span!("request")),
             );
         }
     }
-    .instrument(span)
     .await?;
     Ok(())
 }
 
 async fn handle_request(
-    root: Arc<Path>,
-    (mut send, mut recv): (quinn::SendStream, quinn::RecvStream),
+    root_filepath: Arc<Path>,
+    (mut send_stream, mut receive_stream): (quinn::SendStream, quinn::RecvStream),
 ) -> Result<()> {
-    let req = recv
+    // Get the request
+    let req = receive_stream
         .read_to_end(64 * 1024)
         .await
         .map_err(|e| anyhow!("failed reading request: {}", e))?;
+
+    // Print the request
     let mut escaped = String::new();
-    for &x in &req[..] {
-        let part = ascii::escape_default(x).collect::<Vec<_>>();
+    for &char in &req[..] {
+        let part = ascii::escape_default(char).collect::<Vec<_>>();
         escaped.push_str(str::from_utf8(&part).unwrap());
     }
-    info!(content = %escaped);
+    println!("Got request : {}", escaped);
+
     // Execute the request
-    let resp = process_get(&root, &req).unwrap_or_else(|e| {
+    let resp = process_get(&root_filepath, &req).unwrap_or_else(|e| {
         error!("failed: {}", e);
         format!("failed to process request: {e}\n").into_bytes()
     });
+
     // Write the response
-    send.write_all(&resp)
+    send_stream.write_all(&resp)
         .await
         .map_err(|e| anyhow!("failed to send response: {}", e))?;
+
     // Gracefully terminate the stream
-    send.finish()
+    send_stream.finish()
         .await
         .map_err(|e| anyhow!("failed to shutdown stream: {}", e))?;
-    info!("complete");
+    println!("complete");
+
     Ok(())
 }
 
-fn process_get(root: &Path, x: &[u8]) -> Result<Vec<u8>> {
-    if x.len() < 4 || &x[0..4] != b"GET " {
+fn process_get(root_filepath: &Path, request: &[u8]) -> Result<Vec<u8>> {
+    // Verify the request starts with "GET "
+    if request.len() < 4 || &request[0..4] != b"GET " {
         bail!("missing GET");
     }
-    if x[4..].len() < 2 || &x[x.len() - 2..] != b"\r\n" {
+
+    // Verify the request specifies a path
+    if request[4..].len() < 2 || &request[request.len() - 2..] != b"\r\n" {
         bail!("missing \\r\\n");
     }
-    let x = &x[4..x.len() - 2];
-    let end = x.iter().position(|&c| c == b' ').unwrap_or(x.len());
-    let path = str::from_utf8(&x[..end]).context("path is malformed UTF-8")?;
-    let path = Path::new(&path);
-    let mut real_path = PathBuf::from(root);
-    let mut components = path.components();
+
+    // Construct the request_path
+    let request_path_bytes = &request[4..request.len() - 2];
+    let end = request_path_bytes.iter().position(|&c| c == b' ').unwrap_or(request_path_bytes.len());
+    let request_path_string = str::from_utf8(&request_path_bytes[..end]).context("path is malformed UTF-8")?;
+    let request_path = Path::new(&request_path_string);
+
+    // Identify the absolute file path
+    let mut real_path = PathBuf::from(root_filepath);
+    let mut components = request_path.components();
     match components.next() {
         Some(path::Component::RootDir) => {}
         _ => {
             bail!("path must be absolute");
         }
     }
-    for c in components {
-        match c {
+
+    // Verify that the path components exist
+    for component in components {
+        match component {
             path::Component::Normal(x) => {
                 real_path.push(x);
             }
@@ -261,6 +290,8 @@ fn process_get(root: &Path, x: &[u8]) -> Result<Vec<u8>> {
             }
         }
     }
+
+    // Read the file and return the data
     let data = fs::read(&real_path).context("failed reading file")?;
     Ok(data)
 }
