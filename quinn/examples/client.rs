@@ -10,11 +10,14 @@ use std::{
     sync::Arc,
     time::{Duration, Instant},
 };
+use std::net::{IpAddr, SocketAddr};
 
 use anyhow::{anyhow, Result};
 use clap::Parser;
+use proto::{ClientConfig, IdleTimeout, ServerConfig, TransportConfig, VarInt};
 use tracing::{error, info};
 use url::Url;
+use crate::common::SERVER_STRING;
 
 mod common;
 
@@ -92,21 +95,14 @@ async fn run(options: Opt) -> Result<()> {
         }
     }
 
-    // Create the crypto client config using the root certificates and specified options
-    let mut crypto_client_config = rustls::ClientConfig::builder()
-        .with_safe_defaults()
-        .with_root_certificates(roots)
-        .with_no_client_auth();
-    crypto_client_config.alpn_protocols =
-        common::ALPN_QUIC_HTTP.iter().map(|&x| x.into()).collect();
-    if options.keylog {
-        crypto_client_config.key_log = Arc::new(rustls::KeyLogFile::new());
-    }
+    // Create the QUIC server configuration
+    let (server_config, _server_certificate) = configure_server()?;
 
-    // Create the QUIC client config
-    let client_config = quinn::ClientConfig::new(Arc::new(crypto_client_config));
-    let mut endpoint = quinn::Endpoint::client("[::]:0".parse().unwrap())?;
-    endpoint.set_default_client_config(client_config);
+    // Create the QUIC server endpoint
+    let socket_addr = SocketAddr::new(IpAddr::V4(std::net::Ipv4Addr::LOCALHOST), 62626);
+    let mut server_endpoint = quinn::Endpoint::server(server_config, socket_addr)?;
+    server_endpoint.set_default_client_config(configure_client()); // Required to skip certificate verification
+    println!("Server listening on {}", server_endpoint.local_addr()?);
 
     // Identify the remote host
     let host_string = options
@@ -118,36 +114,41 @@ async fn run(options: Opt) -> Result<()> {
     // Connect to the remote host
     println!("Connecting to {} at {:?}", host_string, remote_host);
     let start = Instant::now();
-    let connection = endpoint
+    let connection = server_endpoint
         .connect(remote_socket_addr, host_string)?
         .await
         .map_err(|e| anyhow!("failed to connect: {}", e))?;
 
-    // Open the bi-directional stream
+    // Open the uni-directional stream
     println!("Connected to {host_string} in {:?}", start.elapsed());
-    let (mut send_stream, mut receive_stream) = connection
-        .open_bi()
-        .await
-        .map_err(|e| anyhow!("failed to open stream: {}", e))?;
+    let mut send_stream = connection.open_uni().await.map_err(|e| anyhow!("failed to open stream: {}", e))?;
 
     // Simulate NAT rebinding after connecting
     if options.rebind {
         let socket = std::net::UdpSocket::bind("[::]:0").unwrap();
         let addr = socket.local_addr().unwrap();
         println!("rebinding to {addr}");
-        endpoint.rebind(socket).expect("rebind failed");
+        server_endpoint.rebind(socket).expect("rebind failed");
     }
 
     // Send the GET request to the server
     let request = format!("GET {}\r\n", options.url.path());
-    send_stream.write_all(request.as_bytes())
+    send_stream
+        .write_all(request.as_bytes())
         .await
         .map_err(|e| anyhow!("failed to send request: {}", e))?;
-    send_stream.finish()
+    send_stream
+        .finish()
         .await
         .map_err(|e| anyhow!("failed to shutdown stream: {}", e))?;
     let response_start = Instant::now();
     println!("Request sent at {:?}", response_start - start);
+
+    // Wait for the server to dial us using a uni-directional stream
+    let mut receive_stream = connection
+        .accept_uni()
+        .await
+        .map_err(|e| anyhow!("failed to accept stream: {}", e))?;
 
     // Get the response
     let resp = receive_stream
@@ -165,15 +166,95 @@ async fn run(options: Opt) -> Result<()> {
     println!("Received {} bytes", resp.len());
     println!("Response: {:?}", resp);
 
+    if resp.starts_with(b"This contains some text, my friend") {
+        println!("The file response is valid!!")
+    } else {
+        panic!("Unexpected response!!")
+    }
+
     // Close the connection
     connection.close(0u32.into(), b"done");
 
     // Give the server a fair chance to receive the close packet
-    endpoint.wait_idle().await;
+    server_endpoint.wait_idle().await;
 
     Ok(())
 }
 
+/// Returns the default server configuration along with its dummy certificate
+fn configure_server() -> io::Result<(ServerConfig, Vec<u8>)> {
+    // Create the dummy server certificate
+    let cert = rcgen::generate_simple_self_signed(vec![SERVER_STRING.into()]).unwrap();
+    let cert_der = cert.serialize_der().unwrap();
+    let priv_key = cert.serialize_private_key_der();
+    let priv_key = rustls::PrivateKey(priv_key);
+    let cert_chain = vec![rustls::Certificate(cert_der.clone())];
+
+    // Create the server transport config
+    let transport_config = create_transport_config();
+
+    // Create the QUIC server configuration
+    let mut server_config =
+        ServerConfig::with_single_cert(cert_chain, priv_key).map_err(|error| {
+            io::Error::new(
+                io::ErrorKind::Other,
+                format!("Invalid server certificate: {:?}", error),
+            )
+        })?;
+    server_config.transport_config(transport_config);
+
+    Ok((server_config, cert_der))
+}
+
 fn duration_secs(x: &Duration) -> f32 {
     x.as_secs() as f32 + x.subsec_nanos() as f32 * 1e-9
+}
+
+struct SkipServerVerification;
+
+impl SkipServerVerification {
+    fn new() -> Arc<Self> {
+        Arc::new(Self)
+    }
+}
+
+impl rustls::client::ServerCertVerifier for SkipServerVerification {
+    fn verify_server_cert(
+        &self,
+        _end_entity: &rustls::Certificate,
+        _intermediates: &[rustls::Certificate],
+        _server_name: &rustls::ServerName,
+        _scts: &mut dyn Iterator<Item = &[u8]>,
+        _ocsp_response: &[u8],
+        _now: std::time::SystemTime,
+    ) -> Result<rustls::client::ServerCertVerified, rustls::Error> {
+        Ok(rustls::client::ServerCertVerified::assertion())
+    }
+}
+
+/// Returns the default client configured that ignores the server certificate
+fn configure_client() -> ClientConfig {
+    // Create the dummy crypto config
+    let crypto_config = rustls::ClientConfig::builder()
+        .with_safe_defaults()
+        .with_custom_certificate_verifier(SkipServerVerification::new())
+        .with_no_client_auth();
+
+    // Create the client transport config
+    let transport_config = create_transport_config();
+
+    // Create the QUIC client configuration
+    let mut client = ClientConfig::new(Arc::new(crypto_config));
+    client.transport_config(transport_config);
+    client
+}
+
+/// Returns a new transport config
+fn create_transport_config() -> Arc<TransportConfig> {
+    let mut transport_config = quinn::TransportConfig::default();
+
+    transport_config.max_idle_timeout(Some(IdleTimeout::from(VarInt::from_u32(20_000)))); // 20 secs
+    transport_config.keep_alive_interval(Some(std::time::Duration::from_secs(20))); // 20 secs
+
+    Arc::new(transport_config)
 }

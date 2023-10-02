@@ -4,6 +4,9 @@
 use quinn::{ClientConfig, Endpoint, ServerConfig};
 use std::{error::Error, net::SocketAddr, sync::Arc};
 
+// Useful constants
+pub const SERVER_STRING: &str = "aptos-node";
+
 /// Constructs a QUIC endpoint configured for use a client only.
 ///
 /// ## Args
